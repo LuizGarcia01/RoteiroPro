@@ -1,0 +1,20 @@
+{
+  "name": "roteiro-pro",
+  "version": "1.0.0",
+  "description": "Sistema SaaS de Roteirização Inteligente para Last Mile",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["logistics", "routing", "last-mile", "saas"],
+  "author": "RoteiroPro",
+  "license": "MIT"
+}
