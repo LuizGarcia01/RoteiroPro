@@ -185,13 +185,7 @@
       padding: 8px 16px; border-radius: 8px; border: none;
       font-size: 13px; font-weight: 600; transition: all .15s;
       white-space: nowrap; cursor: pointer;
-      touch-action: manipulation;  /* prevents double-tap zoom without breaking clicks */
-      -webkit-tap-highlight-color: transparent;
-      user-select: none;
     }
-    .nav-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-    .config-row { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-    .circuit-stop { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
     .btn-primary { background: var(--blue); color: white; }
     .btn-primary:hover { background: #2563eb; }
     .btn-ghost { background: var(--surf2); color: var(--text2); border: 1px solid var(--border); }
@@ -994,76 +988,63 @@ const Engine = {
 
   /* ════════════════════════════════════════
      STEP 3: Or-opt — Reposiciona segmentos
-     Versão segura: trabalha com cópia do array
-     Testa blocos de 1, 2, 3 paradas em cada posição
+     Tenta mover blocos de 1, 2 e 3 paradas
+     para uma posição melhor na rota.
+     Muito eficaz para rotas com "desvios" locais.
   ════════════════════════════════════════ */
-  _orOpt(order, sLat, sLon, stops, matDist, maxIter = 20) {
+  _orOpt(order, sLat, sLon, stops, matDist, maxIter = 30) {
     const n = order.length;
-    if (n < 5) return order;
+    if (n < 4) return order;
 
     const dist = (ai, bi) => {
-      if (ai < 0 && bi < 0) return 0;
-      const sa = ai < 0 ? { lat: sLat, lon: sLon } : stops[order[ai]];
-      const sb = bi < 0 ? { lat: sLat, lon: sLon } : (bi >= n ? stops[order[n-1]] : stops[order[bi]]);
-      if (!sa || !sb) return 0;
-      if (matDist) {
-        const ma = ai < 0 ? 0 : (sa.mi || 0);
-        const mb = bi < 0 ? 0 : (sb.mi || 0);
-        return (matDist[ma]?.[mb] || 0) / 1000;
+      const la = ai < 0 ? sLat : stops[order.length > 0 && ai < n ? order[ai] : 0]?.lat || sLat;
+      const lo = ai < 0 ? sLon : stops[order.length > 0 && ai < n ? order[ai] : 0]?.lon || sLon;
+      if (ai < 0 || ai >= n || bi < 0 || bi >= n) {
+        const sa = ai >= 0 && ai < n ? stops[order[ai]] : { lat: sLat, lon: sLon };
+        const sb = bi >= 0 && bi < n ? stops[order[bi]] : { lat: sLat, lon: sLon };
+        if (matDist) {
+          const ma = ai < 0 ? 0 : sa.mi;
+          const mb = bi < 0 ? 0 : sb.mi;
+          return (matDist[ma]?.[mb] || 0) / 1000;
+        }
+        return Engine.haversine(sa.lat, sa.lon, sb.lat, sb.lon);
       }
+      const sa = stops[order[ai]], sb = stops[order[bi]];
+      if (matDist) return (matDist[sa.mi]?.[sb.mi] || 0) / 1000;
       return Engine.haversine(sa.lat, sa.lon, sb.lat, sb.lon);
     };
 
-    let arr = [...order];
-    let improved = true, iter = 0;
-
+    let improved = true;
+    let iter = 0;
     while (improved && iter < maxIter) {
       improved = false;
       iter++;
+      // Try segment sizes 1, 2, 3
+      for (let segLen = 1; segLen <= Math.min(3, n-2); segLen++) {
+        for (let i = 0; i <= n - segLen; i++) {
+          // Segment: order[i..i+segLen-1]
+          const before = i > 0 ? i-1 : -1;
+          const after  = i + segLen < n ? i + segLen : -1;
 
-      for (let segLen = 1; segLen <= 3; segLen++) {
-        for (let i = 0; i + segLen <= n; i++) {
-          // Cost of removing segment [i, i+segLen-1] from current position
-          const prev = i - 1;
-          const next = i + segLen < n ? i + segLen : -1;
+          // Cost of removing segment
+          const removeCost = (before >= 0 ? dist(before, i) : 0)
+                           + (after  >= 0 ? dist(i+segLen-1, after) : 0)
+                           - (before >= 0 && after >= 0 ? dist(before, after) : 0);
 
-          // Edges removed: prev→i, (i+segLen-1)→next
-          // Edge added: prev→next (if both valid)
-          const removeCost = dist(prev, i) + (next >= 0 ? dist(i+segLen-1, i+segLen) : 0)
-                           - (prev >= 0 && next >= 0 ? dist(prev, next) : 0);
-
-          if (removeCost <= 0) continue; // no gain possible
-
-          // Try inserting segment at each position j (not overlapping)
-          for (let j = 0; j < n; j++) {
-            if (j >= i - 1 && j < i + segLen) continue; // same position
-
+          // Try inserting segment at each other position j
+          for (let j = 0; j <= n - segLen; j++) {
+            if (j >= i - 1 && j <= i + segLen) continue; // same location
             const jnext = j + 1 < n ? j + 1 : -1;
 
-            // Make sure jnext isn't inside our segment
-            if (jnext >= i && jnext < i + segLen) continue;
-
-            // Cost of inserting segment between j and j+1
-            // Use temporary remapped indices
-            const insertCost = (dist(j, i) + dist(i+segLen-1, jnext >= 0 ? jnext : n-1))
-                             - dist(j, jnext >= 0 ? jnext : n-1);
+            // Skip if j is within the segment
+            const insertCost = dist(j, i) + dist(i+segLen-1, j < n ? j+1 : -1) - dist(j, j+1 < n ? j+1 : -1);
 
             if (removeCost - insertCost > 1e-10) {
-              // Apply move: build new array
-              const newArr = [];
-              const seg = arr.slice(i, i + segLen);
-              const withoutSeg = [...arr.slice(0,i), ...arr.slice(i+segLen)];
-              const insertPos = j < i ? j + 1 : j + 1 - segLen;
-              const clampedIns = Math.max(0, Math.min(withoutSeg.length, insertPos));
-              for (let k = 0; k < withoutSeg.length; k++) {
-                if (k === clampedIns) newArr.push(...seg);
-                newArr.push(withoutSeg[k]);
-              }
-              if (newArr.length < withoutSeg.length + seg.length) newArr.push(...seg);
-              if (newArr.length === n) {
-                arr = newArr;
-                improved = true;
-              }
+              // Move segment from i to after j
+              const seg = order.splice(i, segLen);
+              const insertAt = j < i ? j + 1 : j + 1 - segLen;
+              order.splice(insertAt, 0, ...seg);
+              improved = true;
               break;
             }
           }
@@ -1072,57 +1053,11 @@ const Engine = {
         if (improved) break;
       }
     }
-
-    console.log('[Or-opt] ' + iter + ' iterações, n=' + n);
-    return arr;
+    console.log('[Or-opt] ' + iter + ' iterações');
+    return order;
   },
 
-  /* ── Or-opt com matriz (usa distância em metros) ── */
-  _orOptMatrix(order, stops, matDist, maxIter = 20) {
-    const n = order.length;
-    if (n < 5) return order;
-
-    const dist = (ai, bi) => {
-      if (ai < 0 || ai >= n || bi < 0 || bi >= n) return 0;
-      const ma = stops[order[ai]]?.mi || 0;
-      const mb = stops[order[bi]]?.mi || 0;
-      return matDist[ma]?.[mb] || 0;
-    };
-
-    let arr = [...order];
-    let improved = true, iter = 0;
-
-    while (improved && iter < maxIter) {
-      improved = false; iter++;
-      for (let segLen = 1; segLen <= 3; segLen++) {
-        for (let i = 0; i + segLen <= n; i++) {
-          const prev = i-1, next = i+segLen < n ? i+segLen : -1;
-          const removeCost = (prev>=0?dist(prev,i):0) + (next>=0?dist(i+segLen-1,next):0)
-                           - (prev>=0&&next>=0?dist(prev,next):0);
-          if (removeCost <= 0) continue;
-          for (let j = 0; j < n; j++) {
-            if (j >= i-1 && j < i+segLen) continue;
-            const jn = j+1<n?j+1:-1;
-            if (jn >= i && jn < i+segLen) continue;
-            const insertCost = (dist(j,i>0?i:0)+dist(i+segLen-1,jn>=0?jn:n-1)) - (jn>=0?dist(j,jn):0);
-            if (removeCost - insertCost > 0.5) {
-              const seg = arr.slice(i, i+segLen);
-              const rest = [...arr.slice(0,i), ...arr.slice(i+segLen)];
-              const ins = Math.max(0, Math.min(rest.length, j<i?j+1:j+1-segLen));
-              const newArr = [...rest.slice(0,ins), ...seg, ...rest.slice(ins)];
-              if (newArr.length === n) { arr = newArr; improved = true; }
-              break;
-            }
-          }
-          if (improved) break;
-        }
-        if (improved) break;
-      }
-    }
-    return arr;
-  },
-
-    /* ════════════════════════════════════════
+  /* ════════════════════════════════════════
      STEP 4: Recalculate distances + finalize
   ════════════════════════════════════════ */
   _finalize(order, stops, sLat, sLon, matDist, matDur) {
@@ -2179,14 +2114,15 @@ function renderStep2(el) {
 }
 
 
-/* ════════════════════════════════════════════════════════════
-   STEP 3 — HTML render (all onclick logic in global functions)
-════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════
+   STEP 3 — Circuit-style "Detalhes da rota"
+═══════════════════════════════════════════════════ */
 function stepAutoFirst() {}
 function stepAutoCenter() {}
 
 function selectMode(mode) {
   S.routeConfig.name       = document.getElementById('routeName')?.value || S.routeConfig.name;
+  S.routeConfig.trafficKey = S.routeConfig.trafficKey;
   S.routeConfig.mode       = mode;
   renderStep3(document.getElementById('step-content'));
 }
@@ -2195,8 +2131,9 @@ function renderStep3(el) {
   const hasKey   = !!(S.routeConfig.trafficKey?.trim());
   const hasStart = !!(S.routeConfig.startLat);
   const lastStop = S.stops.length ? S.stops[S.stops.length - 1] : null;
-  const startLabel = S.routeConfig.startLabel
-    || (hasStart ? Number(S.routeConfig.startLat).toFixed(4) + ', ' + Number(S.routeConfig.startLon).toFixed(4) : 'Definir ponto de partida');
+  const startLabel = hasStart
+    ? Number(S.routeConfig.startLat).toFixed(4) + ', ' + Number(S.routeConfig.startLon).toFixed(4)
+    : 'Não definido';
 
   el.innerHTML =
     '<div style="max-width:560px;margin:0 auto;padding:8px 0 100px">' +
@@ -2206,11 +2143,12 @@ function renderStep3(el) {
       '<div style="font-size:13px;color:var(--text3);margin-top:3px">' + S.stops.length + ' paradas · Configure e otimize</div>' +
     '</div>' +
 
+    // ── PARTIDA ──
     '<div style="padding:12px 20px 4px;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px">Partida</div>' +
     '<div class="config-row" onclick="openLocationPicker()">' +
       '<div class="config-row-icon" style="background:rgba(59,130,246,.15)">🏠</div>' +
       '<div class="config-row-body">' +
-        '<div class="config-row-label">' + startLabel + '</div>' +
+        '<div class="config-row-label">' + (S.routeConfig.startLabel || (hasStart ? startLabel : 'Definir ponto de partida')) + '</div>' +
         '<div class="config-row-sub">Localização atual ou endereço de saída</div>' +
       '</div>' +
       '<div class="config-row-value">›</div>' +
@@ -2221,8 +2159,10 @@ function renderStep3(el) {
         '<div class="config-row-label">Iniciar agora mesmo</div>' +
         '<div class="config-row-sub">' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) + '</div>' +
       '</div>' +
+      '<div class="config-row-value" style="color:var(--text3)">›</div>' +
     '</div>' +
 
+    // ── DESTINO ──
     '<div style="padding:12px 20px 4px;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px">Destino</div>' +
     '<div class="config-row" style="cursor:default">' +
       '<div class="config-row-icon" style="background:rgba(52,211,153,.12)">🏁</div>' +
@@ -2232,6 +2172,7 @@ function renderStep3(el) {
       '</div>' +
     '</div>' +
 
+    // ── OTIMIZAÇÃO ──
     '<div style="padding:12px 20px 4px;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px">Otimização</div>' +
     Object.entries(MODES_CFG).map(([k, mc]) =>
       '<div class="config-row" onclick="selectMode(\'' + k + '\')" ' +
@@ -2245,6 +2186,7 @@ function renderStep3(el) {
       '</div>'
     ).join('') +
 
+    // ── TRÂNSITO ──
     '<div style="padding:12px 20px 4px;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px">Trânsito</div>' +
     '<div class="config-row" onclick="openTrafficKeyModal()">' +
       '<div class="config-row-icon" style="background:rgba(167,139,246,.12)">🚦</div>' +
@@ -2255,6 +2197,7 @@ function renderStep3(el) {
       (hasKey ? '<span class="badge badge-purple">Ativo</span>' : '<div style="color:var(--text3)">›</div>') +
     '</div>' +
 
+    // ── NOME ──
     '<div style="padding:12px 20px 4px;font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px">Nome</div>' +
     '<div style="padding:8px 20px 16px">' +
       '<input id="routeName" class="form-input" placeholder="Ex: Rota Lisboa Norte" ' +
@@ -2263,287 +2206,253 @@ function renderStep3(el) {
 
     '<div id="config-warning" style="display:none;margin:0 20px 8px;color:var(--amber);background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 14px;font-size:13px">⚠️ Defina o ponto de partida para continuar</div>' +
 
-    '<div style="position:fixed;bottom:0;left:var(--sidebar);right:0;padding:12px 20px 16px;background:var(--surf0);border-top:1px solid var(--border);z-index:50">' +
+    // ── FOOTER CTA ──
+    '<div style="position:fixed;bottom:calc(var(--bottomnav) + var(--safe-bottom));left:var(--sidebar);right:0;padding:12px 20px 16px;background:var(--surf0);border-top:1px solid var(--border);z-index:50">' +
       '<button class="btn btn-primary btn-lg w-full" style="justify-content:center;font-size:15px" onclick="generateRoute()">⚡ Otimizar rota</button>' +
     '</div>' +
     '</div>';
-}
 
+  // ── Location Picker Modal ──
+  window.openLocationPicker = function() {
+    const existing = document.getElementById('loc-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'loc-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:var(--bg);z-index:200;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,0px);padding-top:env(safe-area-inset-top,0px);';
 
-/* ════════════════════════════════════════════════════════════
-   GLOBAL FUNCTIONS — all onclick handlers defined here
-   (not inside other functions — always available)
-════════════════════════════════════════════════════════════ */
+    const initLat = S.routeConfig.startLat || (S.stops.length ? S.stops[0].lat : -23.55);
+    const initLon = S.routeConfig.startLon || (S.stops.length ? S.stops[0].lon : -46.63);
 
-function filterRoutesList(q) { if(window._allRoutes) { const filtered=window._allRoutes.filter(r=>r.name.toLowerCase().includes(q.toLowerCase())||r.mode.includes(q)||r.status.includes(q)); const tb=document.getElementById("routes-tbody"); if(tb) tb.innerHTML=renderRoutesRows(filtered); } }
-
-function clearConfigWarning() {
-  const el = document.getElementById('config-warning');
-  if (el) el.style.display = 'none';
-}
-function onCoordsTyped() {}
-function useCenterOfStops() {
-  if (!S.stops.length) return;
-  S.routeConfig.startLat = S.stops.reduce((a,p)=>a+p.lat,0)/S.stops.length;
-  S.routeConfig.startLon = S.stops.reduce((a,p)=>a+p.lon,0)/S.stops.length;
-  renderStep3(document.getElementById('step-content'));
-}
-function updateTrafficKey(val) { S.routeConfig.trafficKey = val; }
-function updateGeoInfo() {}
-function setStartCoords(la, lo) { S.routeConfig.startLat = la; S.routeConfig.startLon = lo; }
-function initPickerMap() {}
-
-/* ── Location Picker Modal ── */
-function openLocationPicker() {
-  const existing = document.getElementById('loc-modal');
-  if (existing) existing.remove();
-
-  const initLat = S.routeConfig.startLat || (S.stops.length ? S.stops[0].lat : 38.71);
-  const initLon = S.routeConfig.startLon || (S.stops.length ? S.stops[0].lon : -9.14);
-
-  const modal = document.createElement('div');
-  modal.id = 'loc-modal';
-  modal.style.cssText = 'position:fixed;inset:0;background:var(--bg);z-index:500;display:flex;flex-direction:column;';
-  modal.innerHTML =
-    '<div style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--surf0);flex-shrink:0">' +
-      '<button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'loc-modal\').remove()">✕</button>' +
-      '<div style="font-size:16px;font-weight:700">Ponto de Partida</div>' +
-    '</div>' +
-    '<div style="padding:12px 16px;background:var(--surf0);border-bottom:1px solid var(--border);flex-shrink:0;position:relative">' +
-      '<div style="display:flex;gap:8px;align-items:center">' +
-        '<input id="addr-search" class="form-input" placeholder="🔍 Pesquisar endereço ou rua..." style="flex:1;font-size:14px" oninput="onAddrInput(this.value)" autocomplete="off"/>' +
-        '<button class="btn btn-ghost btn-sm" id="gps-modal-btn" onclick="autoGpsModal()" style="white-space:nowrap;flex-shrink:0">📍 GPS</button>' +
+    modal.innerHTML =
+      // ── Top bar ──
+      '<div style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--surf0);flex-shrink:0">' +
+        '<button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'loc-modal\').remove()">✕</button>' +
+        '<div style="font-size:16px;font-weight:700">Ponto de Partida</div>' +
       '</div>' +
-      '<div id="addr-results" style="position:absolute;left:16px;right:16px;top:calc(100% - 1px);background:var(--surf1);border:1px solid var(--border2);border-radius:0 0 10px 10px;z-index:10;max-height:240px;overflow-y:auto;display:none"></div>' +
-    '</div>' +
-    '<div id="loc-map-el" style="flex:1;min-height:0;background:var(--surf0)"></div>' +
-    '<div style="padding:12px 16px;border-top:1px solid var(--border);background:var(--surf0);flex-shrink:0">' +
-      '<div id="loc-addr-label" style="font-size:12px;color:var(--text3);margin-bottom:10px;min-height:16px;font-family:monospace">' +
-        (S.routeConfig.startLabel
-          ? '<span style="color:var(--green2)">📍 ' + S.routeConfig.startLabel + '</span>'
-          : 'Toque no mapa, pesquise ou use o GPS') +
+      // ── Search bar ──
+      '<div style="padding:12px 16px;background:var(--surf0);border-bottom:1px solid var(--border);flex-shrink:0;position:relative">' +
+        '<div style="display:flex;gap:8px;align-items:center">' +
+          '<input id="addr-search" class="form-input" placeholder="🔍 Pesquisar endereço ou rua..." ' +
+            'style="flex:1;font-size:14px" oninput="onAddrInput(this.value)" autocomplete="off"/>' +
+          '<button class="btn btn-ghost btn-sm" onclick="autoGpsModal()" id="gps-modal-btn" style="white-space:nowrap;flex-shrink:0">📍 GPS</button>' +
+        '</div>' +
+        '<div id="addr-results" style="position:absolute;left:16px;right:16px;top:calc(100% - 1px);' +
+          'background:var(--surf1);border:1px solid var(--border2);border-radius:0 0 10px 10px;' +
+          'z-index:10;max-height:240px;overflow-y:auto;display:none">' +
+        '</div>' +
       '</div>' +
-      '<button class="btn btn-primary btn-lg w-full" style="justify-content:center" onclick="confirmLocModal()">✅ Confirmar partida</button>' +
-    '</div>';
-  document.body.appendChild(modal);
+      // ── Map ──
+      '<div id="loc-map-el" style="flex:1;min-height:0;background:var(--surf0)"></div>' +
+      // ── Footer ──
+      '<div style="padding:12px 16px;border-top:1px solid var(--border);background:var(--surf0);flex-shrink:0">' +
+        '<div id="loc-addr-label" style="font-size:12px;color:var(--text3);margin-bottom:10px;min-height:16px;font-family:monospace">' +
+          (S.routeConfig.startLat
+            ? '<span style="color:var(--green2)">📍 ' + Number(S.routeConfig.startLat).toFixed(5) + ', ' + Number(S.routeConfig.startLon).toFixed(5) + '</span>'
+            : 'Toque no mapa ou pesquise um endereço') +
+        '</div>' +
+        '<button class="btn btn-primary btn-lg w-full" style="justify-content:center" onclick="confirmLocModal()">✅ Confirmar partida</button>' +
+      '</div>';
 
-  setTimeout(() => {
-    if (!window.L) { console.warn('Leaflet not loaded'); return; }
-    const lmap = L.map('loc-map-el', { zoomControl: true }).setView([initLat, initLon], 14);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-      { attribution: '©CartoDB · ©OSM', maxZoom: 19 }).addTo(lmap);
+    document.body.appendChild(modal);
 
-    let mk = S.routeConfig.startLat
-      ? L.marker([initLat, initLon], { draggable: true }).addTo(lmap)
-      : null;
-    if (mk) mk.on('dragend', e => _pinLoc(e.target.getLatLng().lat, e.target.getLatLng().lng, true));
+    // Init map
+    setTimeout(() => {
+      const lmap = L.map('loc-map-el', { zoomControl: true }).setView([initLat, initLon], 14);
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+        { attribution: '©CartoDB · ©OSM', maxZoom: 19 }).addTo(lmap);
 
-    lmap.on('click', e => {
-      if (mk) lmap.removeLayer(mk);
-      mk = L.marker([e.latlng.lat, e.latlng.lng], { draggable: true }).addTo(lmap);
-      mk.on('dragend', ev => _pinLoc(ev.target.getLatLng().lat, ev.target.getLatLng().lng, true));
-      _pinLoc(e.latlng.lat, e.latlng.lng, true);
-    });
+      let mk = S.routeConfig.startLat
+        ? L.marker([initLat, initLon], { draggable: true }).addTo(lmap)
+        : null;
+      if (mk) mk.on('dragend', e => pinLoc(e.target.getLatLng().lat, e.target.getLatLng().lng, true));
 
-    S._lmap = lmap;
-    S._getLmk = () => mk;
-    S._setLmk = m => { mk = m; };
+      lmap.on('click', e => {
+        if (mk) lmap.removeLayer(mk);
+        mk = L.marker([e.latlng.lat, e.latlng.lng], { draggable: true }).addTo(lmap);
+        mk.on('dragend', ev => pinLoc(ev.target.getLatLng().lat, ev.target.getLatLng().lng, true));
+        pinLoc(e.latlng.lat, e.latlng.lng, true);
+      });
 
-    async function _pinLoc(la, lo, doReverse) {
-      S._pendingLat = la; S._pendingLon = lo;
-      const lbl = document.getElementById('loc-addr-label');
-      if (lbl) lbl.innerHTML = '<span style="color:var(--text3)">📍 ' + la.toFixed(5) + ', ' + lo.toFixed(5) + '</span>';
-      if (doReverse) {
-        if (lbl) lbl.innerHTML = '<span style="color:var(--text3)">🔄 Identificando endereço...</span>';
-        const addr = await Geocoder.reverse(la, lo).catch(() => null);
-        if (lbl) lbl.innerHTML = '<span style="color:var(--green2)">📍 ' + (addr || la.toFixed(5) + ', ' + lo.toFixed(5)) + '</span>';
-        const inp = document.getElementById('addr-search');
-        if (inp && addr) inp.value = addr;
+      S._lmap = lmap; S._lmk = () => mk;
+      S._setLMk = (newMk) => { mk = newMk; };
+
+      async function pinLoc(la, lo, doReverse) {
+        S._pendingLat = la; S._pendingLon = lo;
+        const label = document.getElementById('loc-addr-label');
+        if (label) label.innerHTML = '<span style="color:var(--text3)">📍 ' + la.toFixed(5) + ', ' + lo.toFixed(5) + '</span>';
+        if (doReverse) {
+          if (label) label.innerHTML = '<span style="color:var(--text3)">🔄 Identificando endereço...</span>';
+          const addr = await Geocoder.reverse(la, lo).catch(() => null);
+          if (label) label.innerHTML =
+            '<span style="color:var(--green2)">📍 ' + (addr || la.toFixed(5) + ', ' + lo.toFixed(5)) + '</span>';
+          const inp = document.getElementById('addr-search');
+          if (inp && addr) inp.value = addr;
+        }
       }
-    }
-    S._pinLoc = _pinLoc;
-    // Auto GPS
-    setTimeout(autoGpsModal, 400);
-  }, 120);
-}
+      S._pinLoc = pinLoc;
+    }, 100);
 
-async function autoGpsModal() {
-  const btn = document.getElementById('gps-modal-btn');
-  if (btn) btn.innerHTML = '📡...';
-  if (!navigator.geolocation) { if (btn) btn.innerHTML = '📍 GPS'; return; }
-  navigator.geolocation.getCurrentPosition(
-    async pos => {
-      const la = pos.coords.latitude, lo = pos.coords.longitude;
+    // Auto GPS on open
+    setTimeout(() => autoGpsModal(), 300);
+
+    window.autoGpsModal = async function() {
+      const btn = document.getElementById('gps-modal-btn');
+      if (btn) btn.innerHTML = '📡...';
+      if (!navigator.geolocation) {
+        if (btn) btn.innerHTML = '📍 GPS';
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        async pos => {
+          const la = pos.coords.latitude, lo = pos.coords.longitude;
+          const lmap = S._lmap;
+          if (lmap) {
+            const cur = S._lmk && S._lmk();
+            if (cur) lmap.removeLayer(cur);
+            const newMk = L.marker([la,lo],{draggable:true}).addTo(lmap);
+            newMk.on('dragend', e => S._pinLoc && S._pinLoc(e.target.getLatLng().lat, e.target.getLatLng().lng, true));
+            S._setLMk && S._setLMk(newMk);
+            lmap.setView([la,lo],15);
+          }
+          if (S._pinLoc) await S._pinLoc(la, lo, true);
+          if (btn) btn.innerHTML = '✅ GPS';
+          setTimeout(() => { if (btn) btn.innerHTML = '📍 GPS'; }, 2000);
+        },
+        err => {
+          const isHttp = location.protocol==='http:' && !['localhost','127.0.0.1'].includes(location.hostname);
+          if (btn) btn.innerHTML = '📍 GPS';
+          const label = document.getElementById('loc-addr-label');
+          if (label && isHttp) label.innerHTML = '<span style="color:var(--amber)">⚠️ GPS requer HTTPS. Use o mapa ou pesquise o endereço.</span>';
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+      );
+    };
+
+    let _debounce = null;
+    window.onAddrInput = function(val) {
+      const res = document.getElementById('addr-results');
+      clearTimeout(_debounce);
+      if (!val || val.length < 3) { if (res) res.style.display = 'none'; return; }
+      _debounce = setTimeout(async () => {
+        try {
+          const results = await Geocoder.search(val);
+          if (!results.length) { if(res) res.style.display='none'; return; }
+          if (res) {
+            res.style.display = 'block';
+            res.innerHTML = results.map((r, i) =>
+              '<div style="padding:12px 16px;border-bottom:1px solid var(--border2);cursor:pointer;' +
+                'transition:background .1s" ' +
+                'onmouseover="this.style.background=\'var(--surf2)\'" ' +
+                'onmouseout="this.style.background=\'\' " ' +
+                'onclick="selectAddrResult(' + i + ')">' +
+                '<div style="font-size:13px;font-weight:600;color:var(--text)">' + r.short + '</div>' +
+                '<div style="font-size:11px;color:var(--text3);margin-top:2px">' + r.label.slice(0,80) + '</div>' +
+              '</div>'
+            ).join('');
+            S._addrResults = results;
+          }
+        } catch(e) { if (res) res.style.display = 'none'; }
+      }, 400);
+    };
+
+    window.selectAddrResult = async function(i) {
+      const r = S._addrResults?.[i];
+      if (!r) return;
+      const res = document.getElementById('addr-results');
+      const inp = document.getElementById('addr-search');
+      if (res) res.style.display = 'none';
+      if (inp) inp.value = r.short + (r.city ? ', ' + r.city : '');
+
       const lmap = S._lmap;
       if (lmap) {
-        const cur = S._getLmk && S._getLmk();
+        const cur = S._lmk && S._lmk();
         if (cur) lmap.removeLayer(cur);
-        const newMk = L.marker([la,lo],{draggable:true}).addTo(lmap);
+        const newMk = L.marker([r.lat, r.lon], { draggable: true }).addTo(lmap);
         newMk.on('dragend', e => S._pinLoc && S._pinLoc(e.target.getLatLng().lat, e.target.getLatLng().lng, true));
-        S._setLmk && S._setLmk(newMk);
-        lmap.setView([la,lo],15);
+        S._setLMk && S._setLMk(newMk);
+        lmap.setView([r.lat, r.lon], 15);
       }
-      if (S._pinLoc) await S._pinLoc(la, lo, true);
-      if (btn) btn.innerHTML = '✅';
-      setTimeout(() => { if (btn) btn.innerHTML = '📍 GPS'; }, 2000);
-    },
-    err => {
-      if (btn) btn.innerHTML = '📍 GPS';
-      const isHttp = location.protocol==='http:' && !['localhost','127.0.0.1'].includes(location.hostname);
-      const lbl = document.getElementById('loc-addr-label');
-      if (lbl) lbl.innerHTML = isHttp
-        ? '<span style="color:var(--amber)">⚠️ GPS requer HTTPS. Use o mapa ou pesquise o endereço.</span>'
-        : '<span style="color:var(--red2)">⚠️ ' + (err.code===1?'Permissão negada':'GPS indisponível') + '. Use o mapa ou pesquise.</span>';
-    },
-    { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
-  );
-}
+      if (S._pinLoc) await S._pinLoc(r.lat, r.lon, false);
+      const label = document.getElementById('loc-addr-label');
+      if (label) label.innerHTML = '<span style="color:var(--green2)">📍 ' + r.short + (r.city?', '+r.city:'') + '</span>';
+    };
 
-let _addrDebounce = null;
-function onAddrInput(val) {
-  const res = document.getElementById('addr-results');
-  clearTimeout(_addrDebounce);
-  if (!val || val.length < 3) { if (res) res.style.display = 'none'; return; }
-  _addrDebounce = setTimeout(async () => {
-    try {
-      const results = await Geocoder.search(val);
-      if (!results.length) { if (res) res.style.display = 'none'; return; }
-      if (res) {
-        res.style.display = 'block';
-        res.innerHTML = results.map((r, i) =>
-          '<div style="padding:12px 16px;border-bottom:1px solid var(--border2);cursor:pointer" ' +
-            'onmouseover="this.style.background=\'var(--surf2)\'" onmouseout="this.style.background=\'\' " ' +
-            'onclick="selectAddrResult(' + i + ')">' +
-            '<div style="font-size:13px;font-weight:600;color:var(--text)">' + r.short + '</div>' +
-            '<div style="font-size:11px;color:var(--text3);margin-top:2px">' + r.label.slice(0,80) + '</div>' +
-          '</div>'
-        ).join('');
-        S._addrResults = results;
+    window.confirmLocModal = function() {
+      const la = S._pendingLat;
+      const lo = S._pendingLon;
+      if (la && lo) {
+        S.routeConfig.startLat = la;
+        S.routeConfig.startLon = lo;
+        // Save reverse-geocoded label
+        const label = document.getElementById('loc-addr-label');
+        S.routeConfig.startLabel = label?.textContent?.replace('📍','').trim() || '';
+        const inp = document.getElementById('addr-search');
+        if (inp?.value) S.routeConfig.startLabel = inp.value;
       }
-    } catch(e) { if (res) res.style.display = 'none'; }
-  }, 400);
+      document.getElementById('loc-modal')?.remove();
+      renderStep3(document.getElementById('step-content'));
+    };
+  };
+
+    // ── Traffic Key Modal ──
+  window.openTrafficKeyModal = function() {
+    const existing = document.getElementById('tm-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'tm-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:300;display:flex;align-items:flex-end;';
+    modal.innerHTML =
+      '<div style="width:100%;max-width:560px;margin:0 auto;background:var(--surf1);border-radius:16px 16px 0 0;padding:24px 20px 32px;border:1px solid var(--border)">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">' +
+          '<div style="font-size:17px;font-weight:700">🚦 Trânsito em tempo real</div>' +
+          '<button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'tm-modal\').remove()">✕</button>' +
+        '</div>' +
+        '<div style="font-size:13px;color:var(--text3);margin-bottom:16px;line-height:1.7">Chave gratuita em <a href="https://developer.tomtom.com/apps" target="_blank" style="color:var(--blue2)">developer.tomtom.com/apps</a> · 2.500 req/dia</div>' +
+        '<div style="display:flex;gap:8px;margin-bottom:8px">' +
+          '<input id="tmk-in" class="form-input" placeholder="Cole sua chave..." style="flex:1;font-family:monospace;font-size:12px" value="' + (S.routeConfig.trafficKey||'') + '"/>' +
+          '<button class="btn btn-ghost btn-sm" id="tmk-test-btn" onclick="testTomTomKeyModal()" style="white-space:nowrap">🔑 Testar</button>' +
+        '</div>' +
+        '<div id="tmk-status" style="font-size:12px;color:var(--text3);min-height:16px;margin-bottom:16px;font-family:monospace"></div>' +
+        '<div style="display:flex;gap:8px">' +
+          '<button class="btn btn-ghost" style="flex:1;justify-content:center" onclick="document.getElementById(\'tm-modal\').remove()">Cancelar</button>' +
+          '<button class="btn btn-primary" style="flex:1;justify-content:center" onclick="saveTomTomKeyModal()">Salvar</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(modal);
+    modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+
+    window.testTomTomKeyModal = async function() {
+      const key=(document.getElementById('tmk-in')?.value||'').trim();
+      const st=document.getElementById('tmk-status');
+      const btn=document.getElementById('tmk-test-btn');
+      if(!key){if(st)st.innerHTML='<span style="color:var(--red2)">Cole a chave</span>';return;}
+      if(btn)btn.innerHTML='⏳...';
+      try{
+        const ctrl=new AbortController();setTimeout(()=>ctrl.abort(),12000);
+        const r=await fetch('https://api.tomtom.com/routing/1/calculateRoute/-23.55,-46.63:-23.56,-46.64/json?key='+key+'&travelMode=car&traffic=true',{signal:ctrl.signal});
+        const d=await r.json();
+        if(r.ok&&d.routes?.length){if(st)st.innerHTML='<span style="color:var(--green2)">✅ Chave válida!</span>';S._pendingTMKey=key;}
+        else if(r.status===403){if(st)st.innerHTML='<span style="color:var(--red2)">❌ Inválida (403)</span>';}
+        else{if(st)st.innerHTML='<span style="color:var(--red2)">❌ HTTP '+r.status+'</span>';}
+      }catch(e){if(st)st.innerHTML='<span style="color:var(--red2)">❌ '+(e.name==='AbortError'?'Timeout':e.message)+'</span>';}
+      finally{if(btn)btn.innerHTML='🔑 Testar';}
+    };
+    window.saveTomTomKeyModal = async function() {
+      const key=S._pendingTMKey||(document.getElementById('tmk-in')?.value||'').trim();
+      if(key){S.routeConfig.trafficKey=key;try{await API.post('/api/config',{tomtom_key:key});toast('Chave TomTom salva!');}catch(e){}}
+      document.getElementById('tm-modal')?.remove();
+      renderStep3(document.getElementById('step-content'));
+    };
+  };
 }
 
-async function selectAddrResult(i) {
-  const r = S._addrResults?.[i];
-  if (!r) return;
-  const res = document.getElementById('addr-results');
-  const inp = document.getElementById('addr-search');
-  if (res) res.style.display = 'none';
-  if (inp) inp.value = r.short + (r.city ? ', ' + r.city : '');
-  const lmap = S._lmap;
-  if (lmap) {
-    const cur = S._getLmk && S._getLmk();
-    if (cur) lmap.removeLayer(cur);
-    const newMk = L.marker([r.lat, r.lon], { draggable: true }).addTo(lmap);
-    newMk.on('dragend', e => S._pinLoc && S._pinLoc(e.target.getLatLng().lat, e.target.getLatLng().lng, true));
-    S._setLmk && S._setLmk(newMk);
-    lmap.setView([r.lat, r.lon], 15);
-  }
-  if (S._pinLoc) await S._pinLoc(r.lat, r.lon, false);
-  const lbl = document.getElementById('loc-addr-label');
-  if (lbl) lbl.innerHTML = '<span style="color:var(--green2)">📍 ' + r.short + (r.city?', '+r.city:'') + '</span>';
-}
-
-function confirmLocModal() {
-  const la = S._pendingLat, lo = S._pendingLon;
-  if (la && lo) {
-    S.routeConfig.startLat = la;
-    S.routeConfig.startLon = lo;
-    const lbl = document.getElementById('loc-addr-label');
-    const inp = document.getElementById('addr-search');
-    S.routeConfig.startLabel = inp?.value || lbl?.textContent?.replace('📍','').trim() || '';
-  }
-  document.getElementById('loc-modal')?.remove();
-  if (S._lmap) { S._lmap.remove(); S._lmap = null; }
-  renderStep3(document.getElementById('step-content'));
-}
-
-/* ── Traffic Key Modal ── */
-function openTrafficKeyModal() {
-  const existing = document.getElementById('tm-modal');
-  if (existing) existing.remove();
-  const modal = document.createElement('div');
-  modal.id = 'tm-modal';
-  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:500;display:flex;align-items:flex-end;';
-  modal.innerHTML =
-    '<div style="width:100%;max-width:560px;margin:0 auto;background:var(--surf1);border-radius:16px 16px 0 0;padding:24px 20px 32px;border:1px solid var(--border)">' +
-      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">' +
-        '<div style="font-size:17px;font-weight:700">🚦 Trânsito em tempo real</div>' +
-        '<button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'tm-modal\').remove()">✕</button>' +
-      '</div>' +
-      '<div style="font-size:13px;color:var(--text3);margin-bottom:16px;line-height:1.7">' +
-        'Chave gratuita em <a href="https://developer.tomtom.com/apps" target="_blank" style="color:var(--blue2)">developer.tomtom.com/apps</a> · 2.500 req/dia' +
-      '</div>' +
-      '<div style="display:flex;gap:8px;margin-bottom:8px">' +
-        '<input id="tmk-in" class="form-input" placeholder="Cole sua chave aqui..." style="flex:1;font-family:monospace;font-size:12px" value="' + (S.routeConfig.trafficKey||'') + '"/>' +
-        '<button class="btn btn-ghost btn-sm" id="tmk-test-btn" onclick="testTomTomKeyModal()" style="white-space:nowrap">🔑 Testar</button>' +
-      '</div>' +
-      '<div id="tmk-status" style="font-size:12px;min-height:16px;margin-bottom:16px;font-family:monospace;color:var(--text3)"></div>' +
-      '<div style="display:flex;gap:8px">' +
-        '<button class="btn btn-ghost" style="flex:1;justify-content:center" onclick="closeTmModal()">Cancelar</button>' +
-        '<button class="btn btn-primary" style="flex:1;justify-content:center" onclick="saveTomTomKeyModal()">Salvar</button>' +
-      '</div>' +
-    '</div>';
-  document.body.appendChild(modal);
-  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
-}
-
-function closeLocModal() { document.getElementById("loc-modal")?.remove(); if(S._lmap){S._lmap.remove();S._lmap=null;} }
-function closeTmModal() { document.getElementById("tm-modal")?.remove(); }
-
-async function testTomTomKeyModal() {
-  const key = (document.getElementById('tmk-in')?.value || '').trim();
-  const st  = document.getElementById('tmk-status');
-  const btn = document.getElementById('tmk-test-btn');
-  if (!key) { if (st) st.innerHTML = '<span style="color:var(--red2)">Cole a chave primeiro</span>'; return; }
-  if (btn) btn.innerHTML = '⏳...';
-  if (st)  st.innerHTML  = '<span style="color:var(--text3)">Testando...</span>';
-  try {
-    const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 12000);
-    const r = await fetch(
-      'https://api.tomtom.com/routing/1/calculateRoute/-38.5,-9.1:-38.51,-9.11/json?key=' + key + '&travelMode=car&traffic=true',
-      { signal: ctrl.signal }
-    );
-    const d = await r.json();
-    if (r.ok && d.routes?.length) {
-      if (st) st.innerHTML = '<span style="color:var(--green2)">✅ Chave válida! TomTom ativo.</span>';
-      S._pendingTMKey = key;
-    } else if (r.status === 403) {
-      if (st) st.innerHTML = '<span style="color:var(--red2)">❌ Chave inválida (403). Verifique no dashboard TomTom.</span>';
-    } else {
-      if (st) st.innerHTML = '<span style="color:var(--red2)">❌ HTTP ' + r.status + '</span>';
-    }
-  } catch(e) {
-    if (st) st.innerHTML = '<span style="color:var(--red2)">❌ ' + (e.name==='AbortError'?'Timeout (12s)':e.message) + '</span>';
-  } finally {
-    if (btn) btn.innerHTML = '🔑 Testar';
-  }
-}
-
-async function saveTomTomKeyModal() {
-  const key = S._pendingTMKey || (document.getElementById('tmk-in')?.value || '').trim();
-  if (key) {
-    S.routeConfig.trafficKey = key;
-    try { await API.post('/api/config', { tomtom_key: key }); toast('✅ Chave TomTom salva!'); } catch(e) {}
-  }
-  document.getElementById('tm-modal')?.remove();
-  renderStep3(document.getElementById('step-content'));
-}
-
-/* ── toggleStop (step 2 stop list) ── */
-function toggleStop(el) {
-  if (el) el.classList.toggle('expanded');
-}
-
-/* ── toggleSheet ── */
-function toggleSheet(idOrEl) {
-  const id = typeof idOrEl === 'string' ? idOrEl
-    : idOrEl?.dataset?.id || idOrEl?.closest?.('[data-id]')?.dataset?.id;
-  const el = id ? document.getElementById(id) : null;
-  if (el) el.classList.toggle('expanded');
-}
+function clearConfigWarning() { const el=document.getElementById('config-warning');if(el)el.style.display='none'; }
+function onCoordsTyped() {}
+function useCenterOfStops() { if(!S.stops.length)return; S.routeConfig.startLat=S.stops.reduce((a,p)=>a+p.lat,0)/S.stops.length; S.routeConfig.startLon=S.stops.reduce((a,p)=>a+p.lon,0)/S.stops.length; renderStep3(document.getElementById('step-content')); }
+function updateTrafficKey(val) { S.routeConfig.trafficKey=val; }
+function updateGeoInfo() {}
+function setStartCoords(la,lo) { S.routeConfig.startLat=la; S.routeConfig.startLon=lo; }
+function initPickerMap() {}
 
 
 async function generateRoute() {
@@ -2937,6 +2846,12 @@ function removeStopAt(idx) {
   renderStep2(document.getElementById('step-content'));
 }
 
+function toggleSheet(idOrEl) {
+  const el = typeof idOrEl === 'string'
+    ? document.getElementById(idOrEl)
+    : document.getElementById(idOrEl.dataset?.id || idOrEl.closest('[data-id]')?.dataset?.id);
+  if (el) el.classList.toggle('expanded');
+}
 
 
 
@@ -2996,7 +2911,7 @@ async function renderRotas() {
         <div class="search-bar flex-1" style="max-width:300px">
           <span>🔍</span>
           <input id="search-input" placeholder="Buscar por nome ou modo..."
-            oninput="filterRoutesList(this.value)" />
+            oninput="filterRoutes('${''}')" />
         </div>
         <div style="color:var(--text3);font-size:13px">${routes.length} rota(s) encontrada(s)</div>
       </div>
@@ -3283,175 +3198,188 @@ document.getElementById('modal-overlay').addEventListener('click', e=>{
 /* ══════════════════════════════════════════
    PAGE: SETUP — tela de boas-vindas / primeira configuração
 ══════════════════════════════════════════ */
-/* ══════════════════════════════════════════
-   SETUP — Tela inicial (primeira configuração)
-══════════════════════════════════════════ */
 function renderSetup() {
-  // Render directly into page-content — simplest, most reliable approach
-  const pc = document.getElementById('page-content');
-  if (!pc) return;
+  setPage('Bem-vindo', '', '');
+  document.getElementById('sidebar').style.display = 'none';
 
-  // Hide sidebar and topbar for full-screen effect
-  const sidebar = document.getElementById('sidebar');
-  const topbar  = document.getElementById('topbar');
-  if (sidebar) sidebar.style.display = 'none';
-  if (topbar)  topbar.style.display  = 'none';
-  pc.style.cssText = 'flex:1;overflow-y:auto;padding:0;background:var(--bg);display:flex;align-items:flex-start;justify-content:center;';
+  const pc = document.getElementById('page-content');
+  pc.style.padding = '0';
+
+  const keyVal = S.routeConfig.trafficKey || '';
+
+  // Build HTML in parts to avoid nested template literal issues
+  const benefits = [
+    ['🛣️', 'Sentido das ruas', 'Mão única respeitada'],
+    ['🚦', 'Trânsito real', 'Congestionamentos evitados'],
+    ['⏱️', 'ETA preciso', 'Tempo real por trecho'],
+    ['💰', 'Gratuito', '2.500 requisições/dia'],
+  ].map(([icon, title, desc]) =>
+    '<div style="background:var(--surf0);border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start">' +
+    '<div style="font-size:20px;flex-shrink:0">' + icon + '</div>' +
+    '<div><div style="font-size:13px;font-weight:700;color:var(--text)">' + title + '</div>' +
+    '<div style="font-size:11px;color:var(--text3);margin-top:2px">' + desc + '</div></div></div>'
+  ).join('');
+
+  const steps = [
+    ['1', 'Acesse', '<a href="https://developer.tomtom.com/apps" target="_blank" style="color:var(--blue2);font-family:monospace;font-size:13px">developer.tomtom.com/apps</a>'],
+    ['2', 'Cadastre-se', '<span style="color:var(--text3);font-size:13px">sem cartão de crédito</span>'],
+    ['3', 'Copie', '<span style="color:var(--amber);font-size:13px;font-family:monospace">"My first API key"</span>'],
+    ['4', 'Cole abaixo', '<span style="color:var(--text3);font-size:13px">e clique em Verificar</span>'],
+  ].map(([n, label, content2]) =>
+    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
+    '<div style="width:22px;height:22px;border-radius:50%;background:var(--blue);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;color:#fff;flex-shrink:0">' + n + '</div>' +
+    '<span style="font-size:13px;color:var(--text2);flex-shrink:0">' + label + ':</span>' +
+    content2 + '</div>'
+  ).join('');
 
   pc.innerHTML =
-    '<div style="max-width:480px;width:100%;padding:40px 20px 60px">' +
+    '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:40px 20px">' +
+    '<div style="max-width:540px;width:100%">' +
 
-      // Logo
-      '<div style="text-align:center;margin-bottom:28px">' +
-        '<div style="font-size:52px;margin-bottom:10px">🚚</div>' +
-        '<div style="font-size:30px;font-weight:800;color:#f1f5f9">Roteiro<span style="color:#60a5fa">Pro</span></div>' +
-        '<div style="color:#64748b;font-size:13px;margin-top:6px">Sistema de roteirização inteligente</div>' +
-      '</div>' +
+    // Logo
+    '<div style="text-align:center;margin-bottom:36px">' +
+    '<div style="display:inline-flex;width:72px;height:72px;background:linear-gradient(135deg,#1d4ed8,#3b82f6);border-radius:20px;font-size:34px;align-items:center;justify-content:center;margin-bottom:18px;box-shadow:0 0 40px rgba(59,130,246,.3)">🚚</div>' +
+    '<div style="font-size:12px;color:var(--blue2);letter-spacing:3px;text-transform:uppercase;font-family:monospace;margin-bottom:8px">BEM-VINDO AO</div>' +
+    '<div style="font-size:38px;font-weight:800;letter-spacing:-1px">Roteiro<span style="color:var(--blue2)">Pro</span></div>' +
+    '<div style="color:var(--text3);font-size:14px;margin-top:8px">Roteirização inteligente para last mile</div>' +
+    '</div>' +
 
-      // Card
-      '<div style="background:#0d1829;border:1px solid #182a45;border-radius:14px;overflow:hidden;margin-bottom:16px">' +
+    // Card
+    '<div style="background:var(--surf1);border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.4)">' +
 
-        // Card header
-        '<div style="padding:16px 18px;border-bottom:1px solid #182a45;background:rgba(167,139,250,.07)">' +
-          '<div style="font-size:15px;font-weight:700;color:#f1f5f9">🚦 Configurar Trânsito em Tempo Real</div>' +
-          '<div style="font-size:12px;color:#64748b;margin-top:3px">Chave TomTom gratuita para roteamento com trânsito real</div>' +
-        '</div>' +
+    // Card header
+    '<div style="padding:22px 26px;border-bottom:1px solid var(--border);background:linear-gradient(135deg,rgba(167,139,250,.07),transparent)">' +
+    '<div style="display:flex;align-items:center;gap:12px">' +
+    '<div style="width:40px;height:40px;border-radius:10px;background:rgba(167,139,250,.15);border:1px solid rgba(167,139,250,.3);display:flex;align-items:center;justify-content:center;font-size:20px">🚦</div>' +
+    '<div><div style="font-size:15px;font-weight:700">Configurar Trânsito em Tempo Real</div>' +
+    '<div style="font-size:12px;color:var(--text3);margin-top:2px">Insira sua chave TomTom gratuita para ativar roteamento real</div></div>' +
+    '</div></div>' +
 
-        // Card body
-        '<div style="padding:20px">' +
+    // Card body
+    '<div style="padding:26px">' +
 
-          // How to get key
-          '<div style="background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.2);border-radius:10px;padding:14px;margin-bottom:18px">' +
-            '<div style="font-size:11px;font-weight:700;color:#60a5fa;margin-bottom:10px;text-transform:uppercase;letter-spacing:.8px">COMO OBTER SUA CHAVE (gratuita)</div>' +
-            '<div style="font-size:13px;color:#94a3b8;line-height:2">' +
-              '<b style="color:#e2e8f0">1.</b> Acesse ' +
-              '<a href="https://developer.tomtom.com/apps" target="_blank" style="color:#60a5fa">developer.tomtom.com/apps</a><br>' +
-              '<b style="color:#e2e8f0">2.</b> Registe-se (sem cartão de crédito)<br>' +
-              '<b style="color:#e2e8f0">3.</b> Copie <span style="color:#f59e0b;font-family:monospace">"My first API key"</span><br>' +
-              '<b style="color:#e2e8f0">4.</b> Cole abaixo e clique em <b style="color:#e2e8f0">Verificar</b>' +
-            '</div>' +
-          '</div>' +
+    // Benefícios
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:22px">' + benefits + '</div>' +
 
-          // Input + verify
-          '<label style="display:block;font-size:11px;font-weight:700;color:#8ba3c1;margin-bottom:8px;text-transform:uppercase;letter-spacing:.6px">CHAVE API TOMTOM</label>' +
-          '<div style="display:flex;gap:8px;margin-bottom:10px">' +
-            '<input id="su-key" type="text" ' +
-              'style="flex:1;background:#080d1a;border:1px solid #182a45;border-radius:8px;color:#e2e8f0;padding:10px 14px;font-size:13px;font-family:monospace;outline:none;" ' +
-              'placeholder="Cole aqui (ex: aBcDeFgH...)"/>' +
-            '<button id="su-verify" ' +
-              'style="background:#0d1829;border:1px solid #182a45;border-radius:8px;color:#94a3b8;padding:10px 16px;cursor:pointer;font-size:13px;white-space:nowrap;font-family:inherit;" ' +
-              'onclick="suVerify()">🔑 Verificar</button>' +
-          '</div>' +
-          '<div id="su-status" style="font-size:12px;min-height:20px;margin-bottom:18px;font-family:monospace;color:#64748b"></div>' +
+    // Como obter
+    '<div style="background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.2);border-radius:10px;padding:16px;margin-bottom:20px">' +
+    '<div style="font-size:11px;font-weight:700;color:var(--blue2);margin-bottom:12px;text-transform:uppercase;letter-spacing:.8px">Como obter sua chave grátis</div>' +
+    steps +
+    '</div>' +
 
-          // Save button
-          '<button id="su-save" ' +
-            'style="width:100%;padding:13px;margin-bottom:10px;border-radius:10px;background:linear-gradient(135deg,#2563eb,#60a5fa);border:none;color:white;font-size:15px;font-weight:700;font-family:inherit;opacity:.4;cursor:default;pointer-events:none;" ' +
-            'onclick="suSave()">✅ Salvar e Continuar</button>' +
+    // Campo da chave
+    '<div style="margin-bottom:16px">' +
+    '<label style="display:block;font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.6px">Chave API TomTom</label>' +
+    '<div style="display:flex;gap:8px">' +
+    '<input id="setup-key" class="form-input" placeholder="Cole aqui (ex: aBcDeFgH...)" ' +
+    'style="flex:1;font-family:monospace;font-size:13px;letter-spacing:.5px" ' +
+    'oninput="setupKeyChanged()" value="' + keyVal + '"/>' +
+    '<button class="btn btn-ghost btn-sm" onclick="setupTestKey()" id="setup-test-btn" style="white-space:nowrap;flex-shrink:0">🔑 Verificar</button>' +
+    '</div>' +
+    '<div id="setup-key-status" style="margin-top:10px;font-size:12px;min-height:18px;font-family:monospace;color:var(--text3)"></div>' +
+    '</div>' +
 
-          // Skip button
-          '<button id="su-skip" ' +
-            'style="width:100%;padding:10px;border-radius:10px;background:transparent;border:1px solid #182a45;color:#64748b;font-size:14px;cursor:pointer;font-family:inherit;" ' +
-            'onclick="suSkip()">Pular — usar OSRM sem trânsito</button>' +
+    // Botões
+    '<div style="display:flex;flex-direction:column;gap:10px">' +
+    '<button id="setup-continue-btn" class="btn btn-primary btn-lg" onclick="setupSaveAndContinue()" ' +
+    'style="justify-content:center;opacity:.4;cursor:not-allowed" disabled>✅ Salvar e Continuar</button>' +
+    '<button class="btn btn-ghost" onclick="setupSkip()" style="justify-content:center;color:var(--text3)">Pular — usar OSRM sem trânsito</button>' +
+    '</div>' +
 
-        '</div>' +
-      '</div>' +
+    '</div></div>' + // card body + card
 
-      '<div style="text-align:center;font-size:12px;color:#334155">Pode alterar depois em ⚙️ Configurações</div>' +
-
-    '</div>';
-
-  // Pre-fill saved key if any
-  const inp = document.getElementById('su-key');
-  if (inp && S.routeConfig.trafficKey) inp.value = S.routeConfig.trafficKey;
+    '<div style="text-align:center;margin-top:18px;font-size:12px;color:var(--text3)">' +
+    'Você pode alterar isso a qualquer momento em ⚙️ Configurações' +
+    '</div>' +
+    '</div></div>'; // inner div + outer div
 }
 
-/* ── Setup action functions — always global, always available ── */
-async function suVerify() {
-  const inp    = document.getElementById('su-key');
-  const status = document.getElementById('su-status');
-  const verBtn = document.getElementById('su-verify');
-  const savBtn = document.getElementById('su-save');
-  if (!inp) return;
-  const key = inp.value.trim();
+
+function setupKeyChanged() {
+  const key = document.getElementById('setup-key')?.value?.trim();
+  const status = document.getElementById('setup-key-status');
+  const btn    = document.getElementById('setup-continue-btn');
+  if (key && key.length > 15) {
+    if (status) status.innerHTML = '<span style="color:var(--amber)">⏳ Clique em Verificar para validar a chave</span>';
+  } else if (key) {
+    if (status) status.innerHTML = '<span style="color:var(--red2)">⚠️ Chave muito curta</span>';
+  } else {
+    if (status) status.innerHTML = '';
+  }
+  // Desabilitar botão até verificar
+  if (btn) { btn.disabled = true; btn.style.opacity = '.4'; btn.style.cursor = 'not-allowed'; }
+}
+
+async function setupTestKey() {
+  const key    = document.getElementById('setup-key')?.value?.trim();
+  const status = document.getElementById('setup-key-status');
+  const btn    = document.getElementById('setup-test-btn');
+  const okBtn  = document.getElementById('setup-continue-btn');
   if (!key) {
-    if (status) status.innerHTML = '<span style="color:#f87171">❌ Cole a chave antes de verificar</span>';
+    if (status) status.innerHTML = '<span style="color:var(--red2)">❌ Cole a chave antes de verificar</span>';
     return;
   }
-  if (verBtn) { verBtn.textContent = '⏳...'; verBtn.disabled = true; }
-  if (status) status.innerHTML = '<span style="color:#64748b">📡 A verificar com TomTom...</span>';
+  if (btn) btn.innerHTML = '⏳ Verificando...';
+  if (status) status.innerHTML = '<span style="color:var(--text3)">📡 Testando conexão com TomTom...</span>';
+
   try {
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), 12000);
-    const r    = await fetch(
-      'https://api.tomtom.com/routing/1/calculateRoute/38.72,-9.14:38.71,-9.13/json?key=' + key + '&travelMode=car&traffic=true',
+    const r = await fetch(
+      `https://api.tomtom.com/routing/1/calculateRoute/-23.55,-46.63:-23.56,-46.64/json?key=${key}&travelMode=car&traffic=true`,
       { signal: ctrl.signal }
     );
     clearTimeout(tid);
     const d = await r.json();
-    if (r.ok && d.routes && d.routes.length > 0) {
-      if (status) status.innerHTML = '<span style="color:#34d399">✅ Chave válida! TomTom com trânsito ativo 🚦</span>';
+    if (r.ok && d.routes?.length) {
+      if (status) status.innerHTML =
+        '<span style="color:var(--green2)">✅ Chave válida! Trânsito em tempo real ativado 🚦</span>';
       S._pendingSetupKey = key;
-      if (savBtn) {
-        savBtn.style.opacity = '1';
-        savBtn.style.cursor  = 'pointer';
-        savBtn.style.pointerEvents = 'auto';
-      }
+      if (okBtn) { okBtn.disabled = false; okBtn.style.opacity = '1'; okBtn.style.cursor = 'pointer'; }
     } else if (r.status === 403) {
-      if (status) status.innerHTML = '<span style="color:#f87171">❌ Chave inválida (403) — verifique no dashboard TomTom</span>';
+      if (status) status.innerHTML =
+        '<span style="color:var(--red2)">❌ Chave inválida ou sem permissão (403). Verifique em developer.tomtom.com/apps</span>';
     } else {
-      const msg = (d.detailedError && d.detailedError.message) || ('HTTP ' + r.status);
-      if (status) status.innerHTML = '<span style="color:#f87171">❌ ' + msg + '</span>';
+      if (status) status.innerHTML =
+        `<span style="color:var(--red2)">❌ Erro ${r.status} — ${JSON.stringify(d).slice(0,80)}</span>`;
     }
-  } catch(err) {
-    const msg = err.name === 'AbortError' ? 'Timeout (12s) — verifique a internet' : err.message;
-    if (status) status.innerHTML = '<span style="color:#f87171">❌ ' + msg + '</span>';
+  } catch(e) {
+    const msg = e.name === 'AbortError' ? 'Timeout — verifique sua internet' : e.message;
+    if (status) status.innerHTML = `<span style="color:var(--red2)">❌ ${msg}</span>`;
   } finally {
-    if (verBtn) { verBtn.textContent = '🔑 Verificar'; verBtn.disabled = false; }
+    if (btn) btn.innerHTML = '🔑 Verificar';
   }
 }
 
-async function suSave() {
-  const key = S._pendingSetupKey || (document.getElementById('su-key')?.value || '').trim();
+async function setupSaveAndContinue() {
+  const key = S._pendingSetupKey || document.getElementById('setup-key')?.value?.trim();
   if (!key) return;
-  const btn = document.getElementById('su-save');
-  if (btn) { btn.textContent = '⏳ A salvar...'; btn.disabled = true; }
   try {
     await API.post('/api/config', { tomtom_key: key, setup_complete: '1' });
     S.routeConfig.trafficKey = key;
     delete S._pendingSetupKey;
-    toast('✅ Chave TomTom salva!');
-  } catch(err) {
-    toast('Erro ao salvar: ' + err.message, 'error');
-    if (btn) { btn.textContent = '✅ Salvar e Continuar'; btn.disabled = false; }
-    return;
+    toast('✅ Chave TomTom salva com sucesso!');
+    // Restaurar sidebar e ir ao dashboard
+    document.getElementById('sidebar').style.display = '';
+    const warn = document.getElementById('settings-warn');
+    if (warn) warn.style.display = 'none';
+    nav('dashboard');
+  } catch(e) {
+    toast('Erro ao salvar: ' + e.message, 'error');
   }
-  // Restore layout
-  const sidebar = document.getElementById('sidebar');
-  const topbar  = document.getElementById('topbar');
-  const pc      = document.getElementById('page-content');
-  if (sidebar) sidebar.style.display = '';
-  if (topbar)  topbar.style.display  = '';
-  if (pc) pc.style.cssText = '';
-  const warn = document.getElementById('settings-warn');
-  if (warn) warn.style.display = 'none';
-  await nav('dashboard');
 }
 
-async function suSkip() {
-  try { await API.post('/api/config', { setup_complete: '1' }); } catch(err) {}
-  // Restore layout
-  const sidebar = document.getElementById('sidebar');
-  const topbar  = document.getElementById('topbar');
-  const pc      = document.getElementById('page-content');
-  if (sidebar) sidebar.style.display = '';
-  if (topbar)  topbar.style.display  = '';
-  if (pc) pc.style.cssText = '';
-  await nav('dashboard');
+async function setupSkip() {
+  try {
+    await API.post('/api/config', { setup_complete: '1' });
+  } catch(e) { /* ignora — continua mesmo sem salvar */ }
+  document.getElementById('sidebar').style.display = '';
+  nav('dashboard');
 }
 
-
-
+/* ══════════════════════════════════════════
+   PAGE: SETTINGS — configurações salvas
+══════════════════════════════════════════ */
 async function renderSettings() {
   setPage('Configurações', 'API Keys e preferências do sistema');
   const pc = document.getElementById('page-content');
@@ -3911,7 +3839,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (bn) bn.style.display = window.innerWidth < 768 ? 'flex' : 'none';
   });
 
-  // touch-action:manipulation handles double-tap zoom via CSS (no JS needed)
+  // Prevent double-tap zoom on buttons (mobile)
+  document.addEventListener('touchend', e => {
+    if (e.target.tagName === 'BUTTON' || e.target.closest('button')) {
+      e.preventDefault();
+    }
+  }, { passive: false });
 
   try {
     // Carregar todas as configs salvas do banco de dados
